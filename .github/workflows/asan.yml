@@ -1,0 +1,85 @@
+name: ASan tree test
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - mdp-asan-ci
+
+env:
+  JUCE_TAG: 9.0.5
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          path: melatonin_inspector
+
+      - name: Clone JUCE
+        run: git clone --depth 1 --branch ${{ env.JUCE_TAG }} https://github.com/juce-framework/JUCE.git JUCE
+
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libx11-dev libxcomposite-dev libxcursor-dev libxext-dev libxi-dev libxinerama-dev libxrandr-dev libxrender-dev libfontconfig1-dev libfreetype-dev ninja-build xvfb
+
+      - name: MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Configure (Linux)
+        if: runner.os == 'Linux'
+        run: >
+          cmake -S melatonin_inspector/ci-asan -B build -G "Ninja Multi-Config"
+          -DJUCE_DIR="$PWD/JUCE" -DCOVERAGE=ON
+          -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: >
+          cmake -S melatonin_inspector/ci-asan -B build -G "Ninja Multi-Config"
+          -DJUCE_DIR="$PWD/JUCE" -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl
+
+      - name: Build
+        run: cmake --build build --config Debug
+
+      - name: Run (Linux)
+        if: runner.os == 'Linux'
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+          UBSAN_OPTIONS: print_stacktrace=1
+          LLVM_PROFILE_FILE: ${{ github.workspace }}/test.profraw
+        run: xvfb-run -a build/MdpTreeTest_artefacts/Debug/MdpTreeTest
+
+      - name: Run (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath build/MdpTreeTest_artefacts/Debug/MdpTreeTest.exe -Wait -PassThru -NoNewWindow -RedirectStandardError test-stderr.txt
+          Get-Content test-stderr.txt
+          if ($p.ExitCode -ne 0) { Write-Error "exit code $($p.ExitCode)"; exit 1 }
+
+      - name: Check changed lines were covered
+        if: runner.os == 'Linux'
+        run: |
+          v=$(clang -dumpversion | cut -d. -f1)
+          llvm-profdata-$v merge -o test.profdata test.profraw
+          git -C melatonin_inspector fetch --quiet https://github.com/sudara/melatonin_inspector.git main
+          python3 melatonin_inspector/ci-asan/check_coverage.py \
+            --repo melatonin_inspector \
+            --base "$(git -C melatonin_inspector merge-base FETCH_HEAD HEAD)" \
+            --source melatonin/components/component_tree_view_item.h \
+            --binary build/MdpTreeTest_artefacts/Debug/MdpTreeTest \
+            --profdata test.profdata \
+            --llvm-cov llvm-cov-$v
